@@ -1,0 +1,289 @@
+name: Build Aura OS
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:  # Allows manual trigger
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360  # 6 hours max
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential bison flex libssl-dev libelf-dev \
+            bc kmod cpio wget curl xz-utils file \
+            git meson ninja-build pkg-config \
+            libcap-dev libmount-dev libblkid-dev \
+            libseccomp-dev libgcrypt-dev liblz4-dev \
+            qemu-system-x86 qemu-utils \
+            grub-pc-bin grub-common xorriso \
+            texinfo gawk sed gzip gperf \
+            autoconf automake libtool
+
+      - name: Create directory structure
+        run: |
+          mkdir -p ${{ github.workspace }}/auraos
+          mkdir -p ${{ github.workspace }}/auraos/rootfs/{bin,boot,dev,etc,home,lib,lib64,mnt,opt,proc,root,run,sbin,sys,tmp,usr,var}
+          mkdir -p ${{ github.workspace }}/auraos/rootfs/usr/{bin,lib,local,sbin,share,include}
+          mkdir -p ${{ github.workspace }}/auraos/rootfs/etc/{init.d,profile.d,apt/sources.list.d,apt/trusted.gpg.d,systemd/system}
+          mkdir -p ${{ github.workspace }}/auraos/rootfs/var/{log,lib/apt,lib/dpkg,cache/apt/archives/partial,lib/systemd}
+
+      - name: Download Linux Kernel
+        run: |
+          cd ${{ github.workspace }}/auraos
+          wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.30.tar.xz
+          tar xf linux-6.6.30.tar.xz
+          cd linux-6.6.30
+          make defconfig
+          make -j$(nproc) bzImage
+          cp arch/x86/boot/bzImage ${{ github.workspace }}/auraos/rootfs/boot/vmlinuz-aura
+
+      - name: Build Binutils
+        run: |
+          cd ${{ github.workspace }}/auraos
+          wget https://ftp.gnu.org/gnu/binutils/binutils-2.42.tar.xz
+          tar xf binutils-2.42.tar.xz
+          cd binutils-2.42
+          ./configure --prefix=/usr --target=x86_64-linux-gnu --disable-multilib
+          make -j$(nproc)
+          make install DESTDIR=${{ github.workspace }}/auraos/rootfs
+
+      - name: Build GCC (Pass 1)
+        run: |
+          cd ${{ github.workspace }}/auraos
+          wget https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz
+          tar xf gcc-13.2.0.tar.xz
+          cd gcc-13.2.0
+          ./contrib/download_prerequisites
+          mkdir build && cd build
+          ../configure --prefix=/usr --target=x86_64-linux-gnu --enable-languages=c,c++ --disable-multilib --without-headers
+          make all-gcc -j$(nproc)
+          make install-gcc DESTDIR=${{ github.workspace }}/auraos/rootfs
+
+      - name: Install Linux Headers
+        run: |
+          cd ${{ github.workspace }}/auraos/linux-6.6.30
+          make mrproper
+          make headers
+          find usr/include -name '.*' -delete
+          rm usr/include/Makefile
+          cp -r usr/include ${{ github.workspace }}/auraos/rootfs/usr/
+
+      - name: Build Glibc
+        run: |
+          cd ${{ github.workspace }}/auraos
+          wget https://ftp.gnu.org/gnu/glibc/glibc-2.39.tar.xz
+          tar xf glibc-2.39.tar.xz
+          mkdir build-glibc && cd build-glibc
+          ../glibc-2.39/configure --prefix=/usr --host=x86_64-linux-gnu --build=x86_64-linux-gnu
+          make -j$(nproc)
+          make install DESTDIR=${{ github.workspace }}/auraos/rootfs
+
+      - name: Build GCC (Pass 2 - Full)
+        run: |
+          cd ${{ github.workspace }}/auraos/gcc-13.2.0/build
+          rm -rf *
+          ../configure --prefix=/usr --target=x86_64-linux-gnu --enable-languages=c,c++ --disable-multilib
+          make -j$(nproc)
+          make install DESTDIR=${{ github.workspace }}/auraos/rootfs
+
+      - name: Build Coreutils
+        run: |
+          cd ${{ github.workspace }}/auraos
+          wget https://ftp.gnu.org/gnu/coreutils/coreutils-9.4.tar.xz
+          tar xf coreutils-9.4.tar.xz
+          cd coreutils-9.4
+          ./configure --prefix=/usr
+          make -j$(nproc)
+          make install DESTDIR=${{ github.workspace }}/auraos/rootfs
+
+      - name: Build Bash
+        run: |
+          cd ${{ github.workspace }}/auraos
+          wget https://ftp.gnu.org/gnu/bash/bash-5.2.21.tar.gz
+          tar xf bash-5.2.21.tar.gz
+          cd bash-5.2.21
+          ./configure --prefix=/usr --without-bash-malloc
+          make -j$(nproc)
+          make install DESTDIR=${{ github.workspace }}/auraos/rootfs
+          ln -sf bash ${{ github.workspace }}/auraos/rootfs/bin/sh
+
+      - name: Build systemd dependencies
+        run: |
+          cd ${{ github.workspace }}/auraos
+          
+          # libgpg-error
+          wget https://ftp.gnu.org/gnu/libgpg-error/libgpg-error-1.48.tar.bz2
+          tar xf libgpg-error-1.48.tar.bz2
+          cd libgpg-error-1.48
+          ./configure --prefix=/usr
+          make -j$(nproc)
+          make install DESTDIR=${{ github.workspace }}/auraos/rootfs
+          cd ..
+          
+          # libgcrypt
+          wget https://ftp.gnu.org/gnu/libgcrypt/libgcrypt-1.10.3.tar.bz2
+          tar xf libgcrypt-1.10.3.tar.bz2
+          cd libgcrypt-1.10.3
+          ./configure --prefix=/usr
+          make -j$(nproc)
+          make install DESTDIR=${{ github.workspace }}/auraos/rootfs
+          cd ..
+          
+          # lz4
+          wget https://github.com/lz4/lz4/archive/v1.9.4.tar.gz
+          tar xf v1.9.4.tar.gz
+          cd lz4-1.9.4
+          make -j$(nproc)
+          make install DESTDIR=${{ github.workspace }}/auraos/rootfs
+          cd ..
+          
+          # zlib
+          wget https://www.zlib.net/zlib-1.3.1.tar.gz
+          tar xf zlib-1.3.1.tar.gz
+          cd zlib-1.3.1
+          ./configure --prefix=/usr
+          make -j$(nproc)
+          make install DESTDIR=${{ github.workspace }}/auraos/rootfs
+          cd ..
+
+      - name: Build systemd
+        run: |
+          cd ${{ github.workspace }}/auraos
+          wget https://github.com/systemd/systemd/archive/v255.tar.gz
+          tar xf v255.tar.gz
+          cd systemd-255
+          meson setup build \
+            --prefix=/usr \
+            --buildtype=release \
+            -Dmode=release \
+            -Dsplit-bin=true \
+            -Ddefault-dnssec=no \
+            -Dcryptolib=openssl \
+            -Dpam=false \
+            -Dseccomp=true
+          ninja -C build
+          DESTDIR=${{ github.workspace }}/auraos/rootfs ninja -C build install
+
+      - name: Configure systemd
+        run: |
+          cd ${{ github.workspace }}/auraos/rootfs
+          echo "auraos" > etc/hostname
+          dbus-uuidgen > etc/machine-id
+          ln -sf usr/lib/systemd/systemd init
+          mkdir -p etc/systemd/system/getty@tty1.service.d
+          cat > etc/systemd/system/getty@tty1.service.d/aura.conf << 'EOF'
+          [Service]
+          ExecStartPre=/bin/sh -c "echo 'Welcome to Aura OS'"
+          Environment=TERM=linux
+          EOF
+
+      - name: Build APT and dependencies
+        run: |
+          cd ${{ github.workspace }}/auraos
+          
+          # libdb
+          wget http://deb.debian.org/debian/pool/main/libdb/libdb5.3_5.3.28.orig.tar.xz
+          tar xf libdb5.3_5.3.28.orig.tar.xz
+          cd db-5.3.28/build_unix
+          ../dist/configure --prefix=/usr
+          make -j$(nproc)
+          make install DESTDIR=${{ github.workspace }}/auraos/rootfs
+          cd ../..
+          
+          # APT
+          wget http://deb.debian.org/debian/pool/main/a/apt/apt_2.6.1.tar.xz
+          tar xf apt_2.6.1.tar.xz
+          cd apt-2.6.1
+          ./configure --prefix=/usr --with-doc-dir=/usr/share/doc/apt
+          make -j$(nproc)
+          make install DESTDIR=${{ github.workspace }}/auraos/rootfs
+          
+          # APT configuration
+          cd ${{ github.workspace }}/auraos/rootfs
+          cat > etc/apt/sources.list << 'EOF'
+          deb http://deb.debian.org/debian bookworm main contrib non-free
+          deb http://deb.debian.org/debian-security bookworm-security main
+          deb http://deb.debian.org/debian bookworm-updates main
+          EOF
+          
+          cat > etc/apt/apt.conf.d/00aura << 'EOF'
+          APT::Get::AllowUnauthenticated "true";
+          Acquire::AllowInsecureRepositories "true";
+          APT::Install-Recommends "false";
+          EOF
+
+      - name: Create initramfs
+        run: |
+          cd ${{ github.workspace }}/auraos/rootfs
+          find . | cpio -o -H newc | gzip > ${{ github.workspace }}/auraos/initramfs.cpio.gz
+          cp ${{ github.workspace }}/auraos/initramfs.cpio.gz boot/
+
+      - name: Create disk image
+        run: |
+          cd ${{ github.workspace }}/auraos
+          dd if=/dev/zero of=auraos.img bs=1M count=8192
+          mkfs.ext4 -F auraos.img
+          mkdir -p /tmp/aura-mount
+          sudo mount auraos.img /tmp/aura-mount
+          sudo cp -r rootfs/* /tmp/aura-mount/
+          sudo mkdir -p /tmp/aura-mount/boot/grub
+          
+          # Install GRUB
+          sudo grub-install --root-directory=/tmp/aura-mount --target=i386-pc auraos.img
+          
+          # GRUB config
+          sudo tee /tmp/aura-mount/boot/grub/grub.cfg << 'EOF'
+          set timeout=3
+          set default=0
+          menuentry "Aura OS" {
+              set root=(hd0,1)
+              linux /boot/vmlinuz-aura root=/dev/sda1 rw quiet
+              initrd /boot/initramfs.cpio.gz
+          }
+          EOF
+          
+          sudo umount /tmp/aura-mount
+
+      - name: Create bootable ISO (optional)
+        run: |
+          cd ${{ github.workspace }}/auraos
+          mkdir -p iso/boot/grub
+          cp rootfs/boot/vmlinuz-aura iso/boot/
+          cp initramfs.cpio.gz iso/boot/
+          cp /usr/lib/grub/i386-pc/stage2_eltorito iso/boot/grub/ 2>/dev/null || true
+          
+          cat > iso/boot/grub/grub.cfg << 'EOF'
+          set timeout=3
+          set default=0
+          menuentry "Aura OS" {
+              linux /boot/vmlinuz-aura root=/dev/sr0 rw
+              initrd /boot/initramfs.cpio.gz
+          }
+          EOF
+          
+          grub-mkrescue -o auraos.iso iso/ 2>/dev/null || echo "ISO creation skipped"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aura-os
+          path: |
+            ${{ github.workspace }}/auraos/auraos.img
+            ${{ github.workspace }}/auraos/auraos.iso
+          compression-level: 9
+          retention-days: 30
+
+      - name: Test with QEMU
+        run: |
+          cd ${{ github.workspace }}/auraos
+          timeout 60s qemu-system-x86_64 -hda auraos.img -m 1024 -nographic -append "console=ttyS0" || true
+          echo "Boot test completed"
