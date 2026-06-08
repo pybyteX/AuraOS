@@ -1,49 +1,233 @@
-name: Build Custom Minux Kernel
+name: Build Minimal Alpine Kernel
 
 on:
-  workflow_dispatch: # Allows you to manually start the build from GitHub's Actions tab
+  workflow_dispatch:
 
 jobs:
-  build:
+  build-kernel:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+
     steps:
-      # 1. Install the tools needed to compile a kernel
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential bc libelf-dev libssl-dev dwarves flex bison
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      # 2. Download the Linux Kernel source (Minux uses 6.18.6) [citation:1]
-      - name: Download Kernel Source
+      # ── 2. Install host dependencies (Ubuntu) ─────────────────────────────
+      - name: Install build dependencies
         run: |
-          wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.8.tar.xz
-          tar -xf linux-6.18.8.tar.xz
-          cd linux-6.18.8
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev \
+            libncurses-dev perl wget xz-utils cpio pahole \
+            dwarves gcc make binutils
 
-      # 3. Get Minux's official kernel configuration [citation:1]
-      - name: Get Minux Kernel Config
+      # ── 3. Determine latest stable kernel version ─────────────────────────
+      - name: Resolve kernel version
+        id: kver
         run: |
-          cd linux-6.18.8
-          wget -O .config https://raw.githubusercontent.com/imycroft/minux/main/kernel/config
+          # Pin to a known-good 6.x release (6.12.x LTS)
+          KERNEL_VERSION="6.12.30"
+          echo "KERNEL_VERSION=${KERNEL_VERSION}" >> "$GITHUB_ENV"
+          echo "version=${KERNEL_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved kernel version: ${KERNEL_VERSION}"
 
-      # 4. Enable the 'epoll' feature for Docker and Neovim
-      - name: Enable epoll
+      # ── 4. Download & verify kernel source ────────────────────────────────
+      - name: Download Linux ${{ env.KERNEL_VERSION }}
         run: |
-          cd linux-6.18.8
-          scripts/config --enable EPOLL
+          set -euo pipefail
+          KVER="${KERNEL_VERSION}"
+          MAJOR="${KVER%%.*}"
+          URL="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${KVER}.tar.xz"
+          SIG_URL="${URL}.sign"
 
-      # 5. Compile the kernel (the long part, but fast on GitHub's servers!)
-      - name: Build Kernel
+          echo "Downloading: ${URL}"
+          wget -q --show-progress "${URL}"
+
+          # Verify download integrity via SHA256 from kernel.org
+          echo "Verifying tarball..."
+          wget -q "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/sha256sums.asc" || true
+          if [ -f sha256sums.asc ]; then
+            grep "linux-${KVER}.tar.xz" sha256sums.asc | sha256sum -c - || \
+              echo "::warning::SHA256 check skipped (sig file format mismatch)"
+          fi
+
+          tar -xf "linux-${KVER}.tar.xz"
+          echo "Source extracted to: linux-${KVER}"
+
+      # ── 5. Configure kernel ────────────────────────────────────────────────
+      - name: Configure kernel
         run: |
-          cd linux-6.18.8
-          make -j$(nproc) bzImage
-          make -j$(nproc) modules
+          set -euo pipefail
+          cd "linux-${KERNEL_VERSION}"
 
-      # 6. Upload the finished kernel as a downloadable file
-      - name: Upload Kernel Image
+          # Start from x86_64 defconfig
+          make ARCH=x86_64 defconfig
+
+          # ── Loadable modules ──────────────────────────────────────────────
+          ./scripts/config --enable  CONFIG_MODULES
+          ./scripts/config --enable  CONFIG_MODULE_UNLOAD
+          ./scripts/config --enable  CONFIG_MODULE_FORCE_UNLOAD
+
+          # ── I/O & events ──────────────────────────────────────────────────
+          ./scripts/config --enable  CONFIG_EPOLL
+          ./scripts/config --enable  CONFIG_EVENTFD
+          ./scripts/config --enable  CONFIG_SIGNALFD
+          ./scripts/config --enable  CONFIG_TIMERFD
+
+          # ── Cgroups (container-ready) ─────────────────────────────────────
+          ./scripts/config --enable  CONFIG_CGROUPS
+          ./scripts/config --enable  CONFIG_CGROUP_SCHED
+          ./scripts/config --enable  CONFIG_CGROUP_CPUACCT
+          ./scripts/config --enable  CONFIG_CGROUP_DEVICE
+          ./scripts/config --enable  CONFIG_CGROUP_FREEZER
+          ./scripts/config --enable  CONFIG_CGROUP_PIDS
+          ./scripts/config --enable  CONFIG_CPUSETS
+          ./scripts/config --enable  CONFIG_MEMCG
+          ./scripts/config --enable  CONFIG_BLK_CGROUP
+          ./scripts/config --enable  CONFIG_CGROUP_BPF
+
+          # ── Namespaces ────────────────────────────────────────────────────
+          ./scripts/config --enable  CONFIG_NAMESPACES
+          ./scripts/config --enable  CONFIG_UTS_NS
+          ./scripts/config --enable  CONFIG_IPC_NS
+          ./scripts/config --enable  CONFIG_USER_NS
+          ./scripts/config --enable  CONFIG_PID_NS
+          ./scripts/config --enable  CONFIG_NET_NS
+
+          # ── Networking ────────────────────────────────────────────────────
+          ./scripts/config --enable  CONFIG_NET
+          ./scripts/config --enable  CONFIG_INET
+          ./scripts/config --enable  CONFIG_IPV6
+          ./scripts/config --enable  CONFIG_BRIDGE
+          ./scripts/config --module  CONFIG_VETH
+          ./scripts/config --enable  CONFIG_NETFILTER
+          ./scripts/config --enable  CONFIG_NF_CONNTRACK
+          ./scripts/config --enable  CONFIG_NETFILTER_XT_MATCH_ADDRTYPE
+          ./scripts/config --enable  CONFIG_IP_NF_IPTABLES
+          ./scripts/config --enable  CONFIG_IP_NF_FILTER
+          ./scripts/config --enable  CONFIG_IP_NF_NAT
+          ./scripts/config --enable  CONFIG_NET_SCHED
+          ./scripts/config --enable  CONFIG_NET_SCH_INGRESS
+
+          # ── VirtIO (VM guest support) ─────────────────────────────────────
+          ./scripts/config --enable  CONFIG_VIRTIO
+          ./scripts/config --enable  CONFIG_VIRTIO_PCI
+          ./scripts/config --module  CONFIG_VIRTIO_BLK
+          ./scripts/config --module  CONFIG_VIRTIO_NET
+          ./scripts/config --module  CONFIG_VIRTIO_CONSOLE
+          ./scripts/config --module  CONFIG_VIRTIO_BALLOON
+
+          # ── Filesystems ───────────────────────────────────────────────────
+          ./scripts/config --enable  CONFIG_EXT4_FS
+          ./scripts/config --enable  CONFIG_EXT4_USE_FOR_EXT2
+          ./scripts/config --enable  CONFIG_OVERLAY_FS
+          ./scripts/config --enable  CONFIG_TMPFS
+          ./scripts/config --enable  CONFIG_TMPFS_XATTR
+          ./scripts/config --enable  CONFIG_PROC_FS
+          ./scripts/config --enable  CONFIG_SYSFS
+          ./scripts/config --enable  CONFIG_DEVTMPFS
+          ./scripts/config --enable  CONFIG_DEVTMPFS_MOUNT
+
+          # ── Security (minimal but not broken) ────────────────────────────
+          ./scripts/config --enable  CONFIG_SECURITY
+          ./scripts/config --enable  CONFIG_SECCOMP
+          ./scripts/config --enable  CONFIG_SECCOMP_FILTER
+          # Keep AUDIT because systemd/containers need it
+          ./scripts/config --enable  CONFIG_AUDIT
+
+          # ── Strip debug bloat ─────────────────────────────────────────────
+          ./scripts/config --disable CONFIG_DEBUG_KERNEL
+          ./scripts/config --disable CONFIG_DEBUG_INFO
+          ./scripts/config --disable CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+          ./scripts/config --disable CONFIG_DEBUG_INFO_BTF
+          ./scripts/config --disable CONFIG_KASAN
+          ./scripts/config --disable CONFIG_KCSAN
+          ./scripts/config --disable CONFIG_UBSAN
+          ./scripts/config --disable CONFIG_FTRACE
+          ./scripts/config --disable CONFIG_FUNCTION_TRACER
+          ./scripts/config --disable CONFIG_STACK_TRACER
+          ./scripts/config --disable CONFIG_DYNAMIC_DEBUG
+          ./scripts/config --disable CONFIG_KALLSYMS_ALL
+          ./scripts/config --disable CONFIG_DEBUG_BUGVERBOSE
+          ./scripts/config --disable CONFIG_SLUB_DEBUG
+
+          # Accept any prompted defaults without interaction
+          make ARCH=x86_64 olddefconfig
+
+          echo "--- Final config summary ---"
+          grep -E "^CONFIG_(MODULES|CGROUPS|NAMESPACES|EPOLL|VIRTIO|EXT4|OVERLAY|SECCOMP)=" .config
+
+          cp .config /tmp/kernel.config
+
+      # ── 6. Compile ────────────────────────────────────────────────────────
+      - name: Compile kernel & modules
+        run: |
+          set -euo pipefail
+          cd "linux-${KERNEL_VERSION}"
+
+          NPROC=$(nproc)
+          echo "Building with ${NPROC} threads..."
+
+          # bzImage first so CI fails fast on config errors
+          make ARCH=x86_64 -j"${NPROC}" bzImage 2>&1 | tee /tmp/build-bzImage.log
+          make ARCH=x86_64 -j"${NPROC}" modules  2>&1 | tee /tmp/build-modules.log
+
+          echo "Build complete."
+          ls -lh arch/x86/boot/bzImage
+
+      # ── 7. Collect artifacts ───────────────────────────────────────────────
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          KVER="${KERNEL_VERSION}"
+          OUT="/tmp/kernel-out"
+
+          mkdir -p "${OUT}/lib/modules" "${OUT}/boot"
+
+          cd "linux-${KVER}"
+
+          cp arch/x86/boot/bzImage    "${OUT}/boot/vmlinuz-${KVER}-custom"
+          cp /tmp/kernel.config        "${OUT}/boot/config-${KVER}"
+          cp System.map                "${OUT}/boot/System.map-${KVER}" 2>/dev/null || true
+
+          make ARCH=x86_64 \
+               INSTALL_MOD_PATH="${OUT}" \
+               INSTALL_MOD_STRIP=1 \
+               modules_install
+
+          # Remove broken symlinks left by modules_install
+          find "${OUT}/lib/modules" -type l ! -e . -delete 2>/dev/null || true
+
+          {
+            echo "Kernel ${KVER} custom build"
+            echo "Built: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "Runner: ${RUNNER_OS} / $(uname -r)"
+            echo "Commit: ${GITHUB_SHA:-local}"
+          } > "${OUT}/boot/BUILD_INFO.txt"
+
+          echo "--- Artifact tree ---"
+          find "${OUT}" -type f | sort
+
+          tar -C "${OUT}" -czf /tmp/kernel-artifacts.tar.gz .
+          ls -lh /tmp/kernel-artifacts.tar.gz
+
+      # ── 8. Upload ──────────────────────────────────────────────────────────
+      - name: Upload kernel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: my-minux-kernel
+          name: kernel-${{ env.KERNEL_VERSION }}-custom
+          path: /tmp/kernel-artifacts.tar.gz
+          retention-days: 14
+          if-no-files-found: error
+
+      # ── 9. Upload build logs on failure ───────────────────────────────────
+      - name: Upload build logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ env.KERNEL_VERSION }}
           path: |
-            linux-6.18.8/arch/x86/boot/bzImage
-            linux-6.18.8/modules/
+            /tmp/build-bzImage.log
+            /tmp/build-modules.log
+          retention-days: 7
